@@ -1,0 +1,22 @@
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: oms-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: order_management
+      POSTGRES_USER: oms_user
+      POSTGRES_PASSWORD: local_dev_password
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oms_user -d order_management"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
