@@ -4,6 +4,9 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.database.connection import engine, get_db
+from app.routers.product import router as product_router
+
+from app.routers.inventory import router as inventory_router
 
 app = FastAPI(
     title="Order Management System API",
@@ -11,6 +14,8 @@ app = FastAPI(
     version="0.1.0",
 )
 
+app.include_router(product_router)
+app.include_router(inventory_router)
 
 @app.get("/", tags=["General"])
 def root() -> dict[str, str]:
@@ -34,3 +39,4 @@ def database_health_check(
             status_code=503,
             detail="Database connection failed",
         ) from exc
+
