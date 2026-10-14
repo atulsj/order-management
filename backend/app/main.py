@@ -5,8 +5,12 @@ from sqlalchemy.orm import Session
 
 from app.database.connection import engine, get_db
 from app.routers.product import router as product_router
-
 from app.routers.inventory import router as inventory_router
+from app.routers.order import router as order_router
+
+import logging
+
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(
     title="Order Management System API",
@@ -16,6 +20,7 @@ app = FastAPI(
 
 app.include_router(product_router)
 app.include_router(inventory_router)
+app.include_router(order_router)
 
 @app.get("/", tags=["General"])
 def root() -> dict[str, str]:
