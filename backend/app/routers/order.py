@@ -1,9 +1,12 @@
-from fastapi import APIRouter, Depends, status
+
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.database.connection import get_db
 from app.schemas.order import OrderCreate, OrderResponse
 from app.services import order_service
+
+from app.schemas.order import OrderListResponse
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
@@ -19,6 +22,20 @@ def create_order(
 ) -> OrderResponse:
     return order_service.create_order(db, data)
 
+@router.get(
+    "",
+    response_model=OrderListResponse,
+)
+def list_orders(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> OrderListResponse:
+    return order_service.list_orders(
+        db,
+        limit=limit,
+        offset=offset,
+    )
 
 @router.get(
     "/{order_id}",

@@ -14,7 +14,7 @@ class OrderCreate(BaseModel):
     items: list[OrderItemCreate] = Field(min_length=1)
 
 
-class OrderItemResponse(BaseModel):
+class OrderItemResponse(BaseModel):  # type: ignore[reportUnknownBaseType]
     model_config = ConfigDict(from_attributes=True)
 
     id: int
@@ -35,3 +35,9 @@ class OrderResponse(BaseModel):
     total_amount: Decimal
     created_at: datetime
     items: list[OrderItemResponse]
+
+class OrderListResponse(BaseModel):
+    items: list[OrderResponse]
+    total: int
+    limit: int
+    offset: int

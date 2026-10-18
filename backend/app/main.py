@@ -7,6 +7,7 @@ from app.database.connection import engine, get_db
 from app.routers.product import router as product_router
 from app.routers.inventory import router as inventory_router
 from app.routers.order import router as order_router
+from app.routers.payment import router as payment_router
 
 import logging
 
@@ -21,6 +22,7 @@ app = FastAPI(
 app.include_router(product_router)
 app.include_router(inventory_router)
 app.include_router(order_router)
+app.include_router(payment_router)
 
 @app.get("/", tags=["General"])
 def root() -> dict[str, str]:

@@ -270,3 +270,32 @@ def cancel_order(db: Session, order_id: int) -> Order:
     except Exception:
         db.rollback()
         raise
+
+from sqlalchemy import func
+
+def list_orders(
+    db: Session,
+    limit: int = 20,
+    offset: int = 0,
+) -> dict:
+    total = db.scalar(
+        select(func.count()).select_from(Order)
+    )
+
+    orders = db.scalars(
+        select(Order)
+        .options(selectinload(Order.items))
+        .order_by(
+            Order.created_at.desc(),
+            Order.id.desc(),
+        )
+        .limit(limit)
+        .offset(offset)
+    ).all()
+
+    return {
+        "items": orders,
+        "total": total or 0,
+        "limit": limit,
+        "offset": offset,
+    }
