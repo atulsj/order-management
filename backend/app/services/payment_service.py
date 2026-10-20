@@ -12,9 +12,11 @@ from app.models.inventory import Inventory
 from app.models.order import Order
 from app.models.order_item import OrderItem
 from app.models.payment import Payment
+
 from app.services.payment_provider import (
     ProviderPaymentStatus,
     process_test_payment,
+    get_test_payment_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -385,3 +387,218 @@ def create_payment(
             "Failed to persist provider result for payment_id=%s", payment_id
         )
         raise
+
+
+def reconcile_pending_payments(db: Session) -> int:
+    """Reconcile due, uncertain payments against the provider.
+
+    Returns the number of provider queries attempted.
+    """
+    now = _now()
+
+    payment_ids = db.scalars(
+        select(Payment.id)
+        .where(
+            Payment.status == "PENDING",
+            Payment.requires_review.is_(True),
+            Payment.next_reconciliation_at.is_not(None),
+            Payment.next_reconciliation_at <= now,
+        )
+        .order_by(Payment.id)
+    ).all()
+
+    reconciled_count = 0
+
+    for payment_id in payment_ids:
+        # Read the provider key first. Do not hold a database transaction
+        # open while making the external provider request.
+        payment = db.get(Payment, payment_id)
+        if payment is None or payment.status != "PENDING":
+            continue
+
+        provider_key = payment.provider_idempotency_key
+        order_id = payment.order_id
+
+        try:
+            result = get_test_payment_status(provider_key)
+            reconciled_count += 1
+        except Exception:
+            logger.exception(
+                "Provider status lookup failed for payment_id=%s",
+                payment_id,
+            )
+
+            try:
+                order = _lock_order(db, order_id)
+                payment = db.scalar(
+                    select(Payment)
+                    .where(Payment.id == payment_id)
+                    .with_for_update()
+                )
+
+                if (
+                    order is not None
+                    and payment is not None
+                    and payment.status == "PENDING"
+                    and payment.requires_review
+                ):
+                    payment.last_reconciled_at = _now()
+                    _mark_for_review(
+                        payment,
+                        "Provider status lookup failed; outcome remains uncertain",
+                    )
+                    db.commit()
+                else:
+                    db.rollback()
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "Could not update reconciliation state for payment_id=%s",
+                    payment_id,
+                )
+
+            continue
+
+        try:
+            # Match create_payment's lock order: order first, payment second.
+            order = _lock_order(db, order_id)
+            payment = db.scalar(
+                select(Payment)
+                .where(Payment.id == payment_id)
+                .with_for_update()
+            )
+
+            # Another request or worker may have resolved this payment.
+            if (
+                order is None
+                or payment is None
+                or payment.status != "PENDING"
+                or not payment.requires_review
+            ):
+                db.rollback()
+                continue
+
+            payment.last_reconciled_at = _now()
+
+            if result.provider_reference:
+                payment.provider_reference = result.provider_reference
+
+            # Uncertain outcomes must preserve the reservation.
+            if result.status in (
+                ProviderPaymentStatus.PROCESSING,
+                ProviderPaymentStatus.UNKNOWN,
+            ):
+                _mark_for_review(
+                    payment,
+                    result.message or f"Provider status: {result.status.value}",
+                )
+                db.commit()
+                continue
+
+            if result.status == ProviderPaymentStatus.FAILED:
+                payment.status = "FAILED"
+                payment.requires_review = False
+                payment.review_reason = None
+                payment.next_reconciliation_at = None
+
+                if payment.attempt_number < MAX_PAYMENT_ATTEMPTS:
+                    payment.retry_window_expires_at = _now() + RETRY_WINDOW
+                elif order.status == "PENDING_PAYMENT":
+                    _release_reserved_inventory(db, order.id)
+                    order.status = "CANCELLED"
+
+                db.commit()
+                continue
+
+            if result.status != ProviderPaymentStatus.SUCCEEDED:
+                _mark_for_review(payment, "Unrecognized provider status")
+                db.commit()
+                continue
+
+            # The provider says the payment succeeded. Do not silently
+            # confirm an order that has already been cancelled or changed.
+            if order.status != "PENDING_PAYMENT":
+                _mark_for_review(
+                    payment,
+                    "Provider reported success but order is no longer pending",
+                )
+                db.commit()
+                continue
+
+            items = db.scalars(
+                select(OrderItem)
+                .where(OrderItem.order_id == order.id)
+                .order_by(OrderItem.product_id)
+            ).all()
+
+            # Aggregate quantities in case an order has multiple rows for
+            # the same product.
+            quantities_by_product: dict[int, int] = {}
+            for item in items:
+                quantities_by_product[item.product_id] = (
+                    quantities_by_product.get(item.product_id, 0)
+                    + item.quantity
+                )
+
+            product_ids = sorted(quantities_by_product)
+
+            inventories = []
+            if product_ids:
+                inventories = db.scalars(
+                    select(Inventory)
+                    .where(Inventory.product_id.in_(product_ids))
+                    .order_by(Inventory.product_id)
+                    .with_for_update()
+                ).all()
+
+            inventory_by_product = {
+                inventory.product_id: inventory
+                for inventory in inventories
+            }
+
+            if len(inventory_by_product) != len(product_ids):
+                _mark_for_review(
+                    payment,
+                    "Inventory is missing after provider success",
+                )
+                db.commit()
+                continue
+
+            # Validate every reservation before changing any inventory.
+            inventory_is_valid = all(
+                inventory_by_product[product_id].quantity_reserved >= quantity
+                and inventory_by_product[product_id].quantity_on_hand >= quantity
+                for product_id, quantity in quantities_by_product.items()
+            )
+
+            if not inventory_is_valid:
+                _mark_for_review(
+                    payment,
+                    "Inventory reservation is inconsistent after provider success",
+                )
+                db.commit()
+                continue
+
+            for product_id, quantity in quantities_by_product.items():
+                inventory = inventory_by_product[product_id]
+                inventory.quantity_reserved -= quantity
+                inventory.quantity_on_hand -= quantity
+
+            payment.status = "SUCCEEDED"
+            payment.requires_review = False
+            payment.review_reason = None
+            payment.next_reconciliation_at = None
+            payment.retry_window_expires_at = None
+            order.status = "CONFIRMED"
+
+            db.commit()
+
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "Reconciliation failed while saving payment_id=%s",
+                payment_id,
+            )
+            raise
+
+    return reconciled_count

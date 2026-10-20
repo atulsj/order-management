@@ -5,6 +5,7 @@ from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from uuid import uuid4
+import os
 
 
 # Local development simulator only.
@@ -83,6 +84,9 @@ def process_test_payment(
                 message="Existing simulated transaction",
             )
 
+        # Choose the outcome configured for this test run.
+        simulated_status = _configured_test_status()
+
         provider_reference = f"test_{uuid4().hex}"
 
         connection.execute(
@@ -99,16 +103,15 @@ def process_test_payment(
                 idempotency_key,
                 provider_reference,
                 str(amount),
-                ProviderPaymentStatus.SUCCEEDED.value,
+                simulated_status.value,
             ),
         )
 
         return PaymentResult(
-            status=ProviderPaymentStatus.SUCCEEDED,
+            status=simulated_status,
             provider_reference=provider_reference,
-            message="Simulated payment success",
+            message=f"Simulated payment {simulated_status.value.lower()}",
         )
-
 
 def get_test_payment_status(
     idempotency_key: str,
@@ -136,3 +139,16 @@ def get_test_payment_status(
         provider_reference=existing["provider_reference"],
         message="Retrieved simulated transaction status",
     )
+
+def _configured_test_status() -> ProviderPaymentStatus:
+    value = os.getenv(
+        "TEST_PROVIDER_OUTCOME",
+        "SUCCEEDED",
+    ).strip().upper()
+
+    try:
+        return ProviderPaymentStatus(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid TEST_PROVIDER_OUTCOME: {value}"
+        ) from exc
