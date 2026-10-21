@@ -1,9 +1,14 @@
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from sqlalchemy import CheckConstraint, ForeignKey, Integer, Numeric
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base
+
+if TYPE_CHECKING:
+    from app.models.allocation import InventoryAllocation
+    from app.models.order import Order
 
 
 class OrderItem(Base):
@@ -36,3 +41,7 @@ class OrderItem(Base):
     )
 
     order: Mapped["Order"] = relationship(back_populates="items")
+    allocations: Mapped[list["InventoryAllocation"]] = relationship(
+        back_populates="order_item",
+        cascade="all, delete-orphan",
+    )

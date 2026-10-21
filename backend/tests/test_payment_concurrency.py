@@ -3,7 +3,6 @@ from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from threading import Barrier
 
-import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker

@@ -1,31 +1,29 @@
 
-import os
-from collections.abc import Generator
-
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session, sessionmaker
 import logging
+from collections.abc import Generator
 from time import perf_counter
 
-from sqlalchemy import event
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.config import get_settings
+
+settings = get_settings()
 logger = logging.getLogger(__name__)
 
-
-
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg://oms_user:local_dev_password@127.0.0.1:5432/order_management",
-)
-
 engine = create_engine(
-    DATABASE_URL,
+    settings.database_url,
     pool_pre_ping=True,
+    pool_size=settings.database_pool_size,
+    max_overflow=settings.database_max_overflow,
+    pool_timeout=settings.database_pool_timeout,
+    pool_recycle=settings.database_pool_recycle,
+    connect_args={"application_name": "oms-api"},
 )
 
 @event.listens_for(engine, "connect")
 def log_new_connection(dbapi_connection, connection_record):
-    logger.info("New PostgreSQL connection established")
+    logger.debug("New PostgreSQL connection established")
 
 
 @event.listens_for(engine, "before_cursor_execute")
@@ -43,7 +41,8 @@ def log_query_duration(
         perf_counter() - context._query_started_at
     ) * 1000
 
-    logger.info("SQL execution took %.2f ms", elapsed_ms)
+    if elapsed_ms >= 250:
+        logger.warning("Slow SQL execution took %.2f ms", elapsed_ms)
 
 SessionLocal = sessionmaker(
     bind=engine,

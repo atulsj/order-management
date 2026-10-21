@@ -1,9 +1,45 @@
+name: oms
+
+x-api-environment: &api-environment
+  ENVIRONMENT: development
+  DATABASE_URL: postgresql+psycopg://oms_user:local_dev_password@postgres:5432/order_management
+  BROKER_URL: amqp://oms:local_dev_password@rabbitmq:5672//
+  RESULT_BACKEND: redis://redis:6379/1
+  REDIS_URL: redis://redis:6379/0
+  KEYCLOAK_ISSUER: http://localhost:8180/realms/oms
+  KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/oms/protocol/openid-connect/certs
+  KEYCLOAK_AUDIENCE: oms-api
+  AUTH_DISABLED: "false"
+  PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-simulator}
+  SIMULATOR_OUTCOME: ${SIMULATOR_OUTCOME:-SUCCEEDED}
+  STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+  STRIPE_PUBLISHABLE_KEY: ${STRIPE_PUBLISHABLE_KEY:-}
+  STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+  SMTP_HOST: mailpit
+  SMTP_PORT: "1025"
+  SMTP_USE_TLS: "false"
+  LOG_JSON: "true"
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+
+x-api-service: &api-service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: *api-environment
+  depends_on:
+    migration:
+      condition: service_completed_successfully
+    rabbitmq:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    keycloak:
+      condition: service_healthy
+  restart: unless-stopped
 
 services:
   postgres:
-    image: postgres:17
-    container_name: oms-postgres
-    restart: unless-stopped
+    image: postgres:17.6
     environment:
       POSTGRES_DB: order_management
       POSTGRES_USER: oms_user
@@ -12,11 +48,149 @@ services:
       - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ../scripts/postgres/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U oms_user -d order_management"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 20
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:4.1.4-management
+    environment:
+      RABBITMQ_DEFAULT_USER: oms
+      RABBITMQ_DEFAULT_PASS: local_dev_password
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:8.2.1-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3.5
+    command: ["start-dev", "--import-realm", "--health-enabled=true"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: local_admin_password
+    ports:
+      - "127.0.0.1:8180:8080"
+    volumes:
+      - ../keycloak/oms-realm.json:/opt/keycloak/data/import/oms-realm.json:ro
+      - keycloak_data:/opt/keycloak/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "exec 3<>/dev/tcp/127.0.0.1/9000; echo -e 'GET /health/ready HTTP/1.1\\r\\nhost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3; grep '200 OK' <&3",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  migration:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    environment: *api-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *api-service
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/live')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  worker:
+    <<: *api-service
+    command:
+      [
+        "celery",
+        "-A",
+        "app.workers.celery_app:celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--queues=payments,notifications,maintenance",
+      ]
+
+  beat:
+    <<: *api-service
+    command:
+      [
+        "celery",
+        "-A",
+        "app.workers.celery_app:celery_app",
+        "beat",
+        "--loglevel=INFO",
+      ]
+
+  mailpit:
+    image: axllent/mailpit:v1.27.8
+    ports:
+      - "127.0.0.1:8025:8025"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.6.0
+    profiles: ["observability"]
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ../observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    profiles: ["observability"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: local_grafana_password
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
 
 volumes:
   postgres_data:
+  rabbitmq_data:
+  redis_data:
+  keycloak_data:
+  grafana_data:

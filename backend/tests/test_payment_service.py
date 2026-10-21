@@ -6,7 +6,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select, update
 
-from app.models import Inventory, Order, OrderItem, Payment, Product
+from app.models import Inventory, Order, Payment, Product
 from app.schemas.order import OrderCreate, OrderItemCreate
 from app.services import payment_service
 from app.services.order_service import create_order
@@ -14,7 +14,6 @@ from app.services.payment_provider import (
     PaymentResult,
     ProviderPaymentStatus,
 )
-
 
 # ---------------------------------------------------------------------
 # Shared helpers
@@ -138,8 +137,8 @@ def test_successful_payment_confirms_order_and_deducts_inventory(
     assert saved_order.status == "CONFIRMED"
 
     inventory = get_inventory(db_session, product.id)
-    assert inventory.quantity_on_hand == 8
-    assert inventory.quantity_reserved == 0
+    assert inventory.quantity_on_hand == 10
+    assert inventory.quantity_reserved == 2
 
 
 # ---------------------------------------------------------------------
@@ -180,8 +179,8 @@ def test_repeated_payment_key_does_not_deduct_inventory_twice(
     assert len(provider_calls) == 1
 
     inventory = get_inventory(db_session, product.id)
-    assert inventory.quantity_on_hand == 8
-    assert inventory.quantity_reserved == 0
+    assert inventory.quantity_on_hand == 10
+    assert inventory.quantity_reserved == 2
 
 
 # ---------------------------------------------------------------------
@@ -500,8 +499,8 @@ def test_failed_payment_retry_succeeds_within_retry_window(
     assert saved_order.status == "CONFIRMED"
 
     inventory = get_inventory(db_session, product.id)
-    assert inventory.quantity_on_hand == 8
-    assert inventory.quantity_reserved == 0
+    assert inventory.quantity_on_hand == 10
+    assert inventory.quantity_reserved == 2
 
 
 # ---------------------------------------------------------------------
@@ -1025,5 +1024,5 @@ def test_successful_retry_records_two_distinct_attempts(
     assert payments[0].idempotency_key != payments[1].idempotency_key
 
     inventory = get_inventory(db_session, product.id)
-    assert inventory.quantity_on_hand == 8
-    assert inventory.quantity_reserved == 0
+    assert inventory.quantity_on_hand == 10
+    assert inventory.quantity_reserved == 2

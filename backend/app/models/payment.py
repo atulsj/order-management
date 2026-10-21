@@ -3,20 +3,22 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     Enum,
     ForeignKey,
+    Integer,
     Numeric,
     String,
+    UniqueConstraint,
     func,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base
-from sqlalchemy import Boolean, Integer
-from sqlalchemy import UniqueConstraint
+
 
 class Payment(Base):
     __tablename__ = "payments"
@@ -82,6 +84,16 @@ class Payment(Base):
         server_default=func.now(),
     )
 
+    principal_subject: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+
+    request_fingerprint: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+
     # Attempt number within this order: 1, 2, or 3.
     attempt_number: Mapped[int] = mapped_column(
         Integer,
@@ -112,6 +124,18 @@ class Payment(Base):
         nullable=True,
     )
 
+    reconciliation_deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+
+    reconciliation_attempts: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+    )
+
     # Deadline for retrying after a definitive failure.
     retry_window_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
@@ -119,3 +143,4 @@ class Payment(Base):
     )
 
     order: Mapped["Order"] = relationship()
+    refunds: Mapped[list["Refund"]] = relationship(back_populates="payment")

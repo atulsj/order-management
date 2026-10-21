@@ -1,36 +1,32 @@
 
-import os
 from decimal import Decimal
 
-from app.services.payment_provider import (
-    ProviderPaymentStatus,
-    process_test_payment,
-    get_test_payment_status,
-)
+from sqlalchemy.orm import Session, sessionmaker
 
-amount = Decimal("100.00")
+from app.core.config import get_settings
+from app.integrations.payments.simulator import SimulatorPaymentProvider
+from app.integrations.payments.types import ProviderStatus
 
-# Use a unique key so old simulator transactions don't affect this test.
-test_key = "manual-test-" + os.urandom(8).hex()
 
-os.environ["TEST_PROVIDER_OUTCOME"] = "FAILED"
-failed_result = process_test_payment(amount, test_key)
+def test_simulator_persists_idempotent_result(db_session, monkeypatch):
+    factory = sessionmaker(
+        bind=db_session.get_bind(),
+        class_=Session,
+        expire_on_commit=False,
+    )
+    provider = SimulatorPaymentProvider(factory)
+    monkeypatch.setattr(get_settings(), "simulator_outcome", "FAILED")
+    first = provider.create_payment(
+        Decimal("100.00"), "USD", "simulator-idempotency", 1
+    )
+    monkeypatch.setattr(get_settings(), "simulator_outcome", "SUCCEEDED")
+    repeated = provider.create_payment(
+        Decimal("100.00"), "USD", "simulator-idempotency", 1
+    )
+    queried = provider.get_payment(
+        first.provider_reference or "", "simulator-idempotency"
+    )
 
-print("First result:", failed_result.status.value)
-assert failed_result.status == ProviderPaymentStatus.FAILED
-
-# Reusing the same key must return the stored result,
-# even after changing the configured outcome.
-os.environ["TEST_PROVIDER_OUTCOME"] = "SUCCEEDED"
-repeated_result = process_test_payment(amount, test_key)
-
-print("Repeated result:", repeated_result.status.value)
-assert repeated_result.status == ProviderPaymentStatus.FAILED
-
-# Status lookup must return the same stored transaction.
-status_result = get_test_payment_status(test_key)
-
-print("Lookup result:", status_result.status.value)
-assert status_result.status == ProviderPaymentStatus.FAILED
-
-print("PASS: simulator outcome and idempotency checks")
+    assert first.status == ProviderStatus.FAILED
+    assert repeated == first
+    assert queried.status == ProviderStatus.FAILED

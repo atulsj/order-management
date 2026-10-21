@@ -1,5 +1,5 @@
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -55,7 +55,7 @@ def create_uncertain_payment(db_session, sku):
         requires_review=True,
         review_reason="Provider outcome is uncertain",
         next_reconciliation_at=(
-            datetime.now(timezone.utc) - timedelta(minutes=1)
+            datetime.now(UTC) - timedelta(minutes=1)
         ),
     )
     db_session.add(payment)
@@ -97,8 +97,8 @@ def test_reconciliation_success_confirms_order_and_deducts_stock(
     assert order.status == "CONFIRMED"
     assert payment.status == "SUCCEEDED"
     assert payment.requires_review is False
-    assert inventory.quantity_on_hand == 8
-    assert inventory.quantity_reserved == 0
+    assert inventory.quantity_on_hand == 10
+    assert inventory.quantity_reserved == 2
 
 
 def test_reconciliation_unknown_status_keeps_payment_pending(
@@ -145,7 +145,7 @@ def test_reconciliation_does_not_process_not_yet_due_payment(
 
     payment = db_session.get(Payment, payment_id)
     payment.next_reconciliation_at = (
-        datetime.now(timezone.utc) + timedelta(minutes=10)
+        datetime.now(UTC) + timedelta(minutes=10)
     )
     db_session.commit()
 

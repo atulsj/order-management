@@ -3,7 +3,8 @@ from logging.config import fileConfig
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 from app.database.base import Base
-from app.models import Product
+import app.models
+from app.core.config import get_settings
 from alembic import context
 import os
 
@@ -59,10 +60,7 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
-    database_url = os.getenv(
-        "DATABASE_URL",
-        config.get_main_option("sqlalchemy.url"),
-    )
+    database_url = get_settings().database_url
 
     connectable = engine_from_config(
         {

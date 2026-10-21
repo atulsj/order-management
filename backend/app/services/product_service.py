@@ -1,8 +1,10 @@
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
+from app.models.inventory import Inventory
 from app.models.product import Product
 from app.schemas.product import ProductCreate, ProductUpdate
 
@@ -24,9 +26,49 @@ def create_product(db: Session, data: ProductCreate) -> Product:
     return product
 
 
-def list_products(db: Session) -> list[Product]:
-    statement = select(Product).order_by(Product.id)
-    return list(db.scalars(statement).all())
+def list_products(
+    db: Session,
+    search: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> dict:
+    filters: list[ColumnElement[bool]] = [Product.is_active.is_(True)]
+    if search:
+        pattern = f"%{search.strip()}%"
+        filters.append(or_(Product.name.ilike(pattern), Product.sku.ilike(pattern)))
+    total = db.scalar(select(func.count()).select_from(Product).where(*filters)) or 0
+    rows = db.execute(
+        select(
+            Product,
+            func.coalesce(
+                func.sum(Inventory.quantity_on_hand - Inventory.quantity_reserved),
+                0,
+            ).label("quantity_available"),
+        )
+        .outerjoin(Inventory, Inventory.product_id == Product.id)
+        .where(*filters)
+        .group_by(Product.id)
+        .order_by(Product.name, Product.id)
+        .limit(limit)
+        .offset(offset)
+    ).all()
+    return {
+        "items": [
+            {
+                "id": product.id,
+                "sku": product.sku,
+                "name": product.name,
+                "description": product.description,
+                "price": product.price,
+                "is_active": product.is_active,
+                "quantity_available": quantity_available,
+            }
+            for product, quantity_available in rows
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 def get_product(db: Session, product_id: int) -> Product:

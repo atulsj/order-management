@@ -4,7 +4,6 @@ from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from threading import Event
 
-import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
@@ -104,6 +103,8 @@ def test_cancellation_during_provider_call_does_not_corrupt_inventory(
         allow_provider_to_finish.set()
         payment_result = future.result(timeout=20)
 
+    assert cancel_result in {"cancelled", 409}
+    assert not isinstance(payment_result, TimeoutError)
     db_session.expire_all()
     final_order = db_session.get(Order, order_id)
     final_inventory = db_session.scalar(

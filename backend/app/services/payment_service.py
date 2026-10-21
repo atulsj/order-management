@@ -1,6 +1,8 @@
 
 import logging
-from datetime import datetime, timedelta, timezone
+import random
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from uuid import uuid4
 
 from fastapi import HTTPException, status
@@ -8,15 +10,18 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
+from app.integrations.payments.factory import get_payment_provider
+from app.models.allocation import InventoryAllocation
+from app.models.integration_event import OutboxEvent
 from app.models.inventory import Inventory
 from app.models.order import Order
+from app.models.order_event import OrderEvent
 from app.models.order_item import OrderItem
 from app.models.payment import Payment
-
 from app.services.payment_provider import (
-    ProviderPaymentStatus,
-    process_test_payment,
     get_test_payment_status,
+    process_test_payment,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,14 +32,52 @@ RECONCILIATION_DELAY = timedelta(minutes=1)
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _mark_for_review(payment: Payment, reason: str) -> None:
     """Keep uncertain payments pending; never treat uncertainty as failure."""
+    now = _now()
+    settings = get_settings()
     payment.requires_review = True
     payment.review_reason = reason
-    payment.next_reconciliation_at = _now() + RECONCILIATION_DELAY
+    if payment.reconciliation_deadline_at is None:
+        payment.reconciliation_deadline_at = now + timedelta(
+            hours=settings.reconciliation_deadline_hours
+        )
+    if now >= payment.reconciliation_deadline_at:
+        payment.review_reason = f"Reconciliation deadline exceeded: {reason}"
+        payment.next_reconciliation_at = None
+        return
+    payment.reconciliation_attempts += 1
+    minutes = min(60, 2 ** min(payment.reconciliation_attempts - 1, 6))
+    jitter = random.uniform(0.8, 1.2)
+    candidate = now + timedelta(minutes=minutes * jitter)
+    payment.next_reconciliation_at = min(candidate, payment.reconciliation_deadline_at)
+
+
+def _create_provider_payment(
+    amount,
+    provider_key: str,
+    order_id: int,
+    currency: str,
+):
+    settings = get_settings()
+    if settings.payment_provider == "simulator":
+        return process_test_payment(amount, provider_key)
+    return get_payment_provider().create_payment(
+        amount, currency, provider_key, order_id
+    )
+
+
+def _query_provider_payment(payment: Payment):
+    settings = get_settings()
+    if settings.payment_provider == "simulator":
+        return get_test_payment_status(payment.provider_idempotency_key)
+    return get_payment_provider().get_payment(
+        payment.provider_reference or "",
+        payment.provider_idempotency_key,
+    )
 
 
 def _lock_order(db: Session, order_id: int) -> Order | None:
@@ -47,57 +90,131 @@ def _lock_order(db: Session, order_id: int) -> Order | None:
 
 def _release_reserved_inventory(db: Session, order_id: int) -> None:
     """Release this order's reservations without changing on-hand stock."""
-    items = db.scalars(
-        select(OrderItem)
-        .where(OrderItem.order_id == order_id)
-        .order_by(OrderItem.product_id)
-    ).all()
-
-    quantities_by_product: dict[int, int] = {}
-    for item in items:
-        quantities_by_product[item.product_id] = (
-            quantities_by_product.get(item.product_id, 0)
-            + item.quantity
+    allocations = db.scalars(
+        select(InventoryAllocation)
+        .join(OrderItem, OrderItem.id == InventoryAllocation.order_item_id)
+        .where(
+            OrderItem.order_id == order_id,
+            InventoryAllocation.status == "RESERVED",
         )
-
-    product_ids = sorted(quantities_by_product)
-    if not product_ids:
-        return
-
-    inventories = db.scalars(
-        select(Inventory)
-        .where(Inventory.product_id.in_(product_ids))
-        .order_by(Inventory.product_id)
+        .order_by(InventoryAllocation.inventory_id, InventoryAllocation.id)
         .with_for_update()
     ).all()
-
-    inventory_by_product = {
-        inventory.product_id: inventory for inventory in inventories
-    }
-
-    if len(inventory_by_product) != len(product_ids):
+    inventory_ids = sorted({allocation.inventory_id for allocation in allocations})
+    if not inventory_ids:
+        return
+    inventories = db.scalars(
+        select(Inventory)
+        .where(Inventory.id.in_(inventory_ids))
+        .order_by(Inventory.id)
+        .with_for_update()
+    ).all()
+    inventory_by_id = {inventory.id: inventory for inventory in inventories}
+    if len(inventory_by_id) != len(inventory_ids):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Inventory is missing for an order item",
         )
-
-    # Validate all reservations before changing any of them.
-    for product_id, quantity in quantities_by_product.items():
-        inventory = inventory_by_product[product_id]
-        if inventory.quantity_reserved < quantity:
+    for allocation in allocations:
+        inventory = inventory_by_id[allocation.inventory_id]
+        if inventory.quantity_reserved < allocation.quantity:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Inventory reservation is inconsistent",
             )
+    for allocation in allocations:
+        inventory_by_id[allocation.inventory_id].quantity_reserved -= allocation.quantity
+        allocation.status = "RELEASED"
 
-    for product_id, quantity in quantities_by_product.items():
-        inventory_by_product[product_id].quantity_reserved -= quantity
+
+def apply_payment_result(
+    db: Session,
+    payment_id: int,
+    result,
+    actor_subject: str | None = None,
+    reconciled: bool = False,
+) -> Payment:
+    preview = db.get(Payment, payment_id)
+    if preview is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Payment not found")
+    order = _lock_order(db, preview.order_id)
+    payment = db.scalar(
+        select(Payment).where(Payment.id == payment_id).with_for_update()
+    )
+    if order is None or payment is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Order or payment not found")
+    if payment.status != "PENDING":
+        return payment
+    if reconciled:
+        payment.last_reconciled_at = _now()
+    if result.provider_reference:
+        payment.provider_reference = result.provider_reference
+    outcome = result.status.value
+    if outcome in {"PROCESSING", "UNKNOWN"}:
+        _mark_for_review(
+            payment,
+            result.message or f"Provider status: {outcome}",
+        )
+    elif outcome == "FAILED":
+        payment.status = "FAILED"
+        payment.requires_review = False
+        payment.review_reason = None
+        payment.next_reconciliation_at = None
+        if payment.attempt_number < MAX_PAYMENT_ATTEMPTS:
+            payment.retry_window_expires_at = _now() + RETRY_WINDOW
+        elif order.status == "PENDING_PAYMENT":
+            _release_reserved_inventory(db, order.id)
+            order.status = "CANCELLED"
+    elif outcome == "SUCCEEDED":
+        if order.status != "PENDING_PAYMENT":
+            _mark_for_review(
+                payment,
+                "Provider reported success but order is no longer pending",
+            )
+        else:
+            payment.status = "SUCCEEDED"
+            payment.requires_review = False
+            payment.review_reason = None
+            payment.next_reconciliation_at = None
+            payment.retry_window_expires_at = None
+            order.status = "CONFIRMED"
+            db.add(
+                OrderEvent(
+                    order_id=order.id,
+                    event_type=(
+                        "PAYMENT_RECONCILED"
+                        if reconciled
+                        else "PAYMENT_CONFIRMED"
+                    ),
+                    actor_subject=actor_subject,
+                    data={"payment_id": payment.id},
+                )
+            )
+            db.add(
+                OutboxEvent(
+                    event_type="payment.succeeded",
+                    aggregate_type="payment",
+                    aggregate_id=str(payment.id),
+                    payload={"payment_id": payment.id, "order_id": order.id},
+                    attempts=0,
+                )
+            )
+    else:
+        _mark_for_review(payment, "Unrecognized provider status")
+    db.commit()
+    db.refresh(payment)
+    object.__setattr__(
+        payment, "client_secret", getattr(result, "client_secret", None)
+    )
+    return payment
 
 
 def create_payment(
     db: Session,
     order_id: int,
     idempotency_key: str,
+    principal_subject: str | None = None,
+    request_fingerprint: str | None = None,
 ) -> Payment:
     # Phase 1: Lock the order and persist a payment attempt.
 
@@ -120,6 +237,22 @@ def create_payment(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Idempotency key was used for another order",
+            )
+        if (
+            principal_subject is not None
+            and existing_payment.principal_subject not in {None, principal_subject}
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Idempotency key was used by another principal",
+            )
+        if (
+            request_fingerprint is not None
+            and existing_payment.request_fingerprint not in {None, request_fingerprint}
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Idempotency key was reused with different input",
             )
 
         if existing_payment.status == "PENDING":
@@ -190,6 +323,11 @@ def create_payment(
         provider_idempotency_key=provider_key,
         attempt_number=attempt_number,
         requires_review=False,
+        principal_subject=principal_subject,
+        request_fingerprint=request_fingerprint
+        or sha256(f"payment:{order_id}".encode()).hexdigest(),
+        reconciliation_deadline_at=_now()
+        + timedelta(hours=get_settings().reconciliation_deadline_hours),
     )
 
     db.add(payment)
@@ -231,7 +369,12 @@ def create_payment(
 
     # Phase 2: Call the provider outside the PostgreSQL transaction.
     try:
-        result = process_test_payment(amount, provider_key)
+        result = _create_provider_payment(
+            amount,
+            provider_key,
+            order_id,
+            order.currency,
+        )
     except Exception as exc:
         logger.exception(
             "Provider outcome uncertain for payment_id=%s", payment_id
@@ -258,129 +401,13 @@ def create_payment(
             detail="Payment outcome is uncertain; reconciliation is required",
         ) from exc
 
-    # Phase 3: Save the outcome and apply business changes atomically.
     try:
-        order = _lock_order(db, order_id)
-        payment = db.scalar(
-            select(Payment)
-            .where(Payment.id == payment_id)
-            .with_for_update()
+        return apply_payment_result(
+            db,
+            payment_id,
+            result,
+            actor_subject=principal_subject,
         )
-
-        if order is None or payment is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Order or payment not found",
-            )
-
-        # Another worker may have reconciled this attempt already.
-        if payment.status != "PENDING":
-            return payment
-
-        payment.provider_reference = result.provider_reference
-
-        if result.status in (
-            ProviderPaymentStatus.PROCESSING,
-            ProviderPaymentStatus.UNKNOWN,
-        ):
-            _mark_for_review(
-                payment,
-                result.message or f"Provider status: {result.status.value}",
-            )
-            db.commit()
-            db.refresh(payment)
-            return payment
-
-        if result.status == ProviderPaymentStatus.FAILED:
-            payment.status = "FAILED"
-            payment.requires_review = False
-            payment.review_reason = None
-            payment.next_reconciliation_at = None
-
-            if attempt_number < MAX_PAYMENT_ATTEMPTS:
-                payment.retry_window_expires_at = _now() + RETRY_WINDOW
-            else:
-                # Third definitive failure: cancel and release reservations.
-                if order.status == "PENDING_PAYMENT":
-                    _release_reserved_inventory(db, order_id)
-                    order.status = "CANCELLED"
-
-            db.commit()
-            db.refresh(payment)
-            return payment
-
-        if result.status != ProviderPaymentStatus.SUCCEEDED:
-            _mark_for_review(payment, "Unrecognized provider status")
-            db.commit()
-            db.refresh(payment)
-            return payment
-
-        if order.status != "PENDING_PAYMENT":
-            # Do not consume inventory if the order is no longer payable.
-            _mark_for_review(
-                payment,
-                "Provider reported success but order is no longer pending",
-            )
-            db.commit()
-            db.refresh(payment)
-            return payment
-
-        items = db.scalars(
-            select(OrderItem)
-            .where(OrderItem.order_id == order_id)
-            .order_by(OrderItem.product_id)
-        ).all()
-
-        product_ids = sorted({item.product_id for item in items})
-        inventories = []
-
-        if product_ids:
-            inventories = db.scalars(
-                select(Inventory)
-                .where(Inventory.product_id.in_(product_ids))
-                .order_by(Inventory.product_id)
-                .with_for_update()
-            ).all()
-
-        inventory_by_product = {
-            inventory.product_id: inventory for inventory in inventories
-        }
-
-        if len(inventory_by_product) != len(product_ids):
-            _mark_for_review(payment, "Inventory is missing after provider success")
-            db.commit()
-            db.refresh(payment)
-            return payment
-
-        for item in items:
-            inventory = inventory_by_product[item.product_id]
-            if (
-                inventory.quantity_reserved < item.quantity
-                or inventory.quantity_on_hand < item.quantity
-            ):
-                _mark_for_review(
-                    payment, "Inventory reservation is inconsistent after success"
-                )
-                db.commit()
-                db.refresh(payment)
-                return payment
-
-        for item in items:
-            inventory = inventory_by_product[item.product_id]
-            inventory.quantity_reserved -= item.quantity
-            inventory.quantity_on_hand -= item.quantity
-
-        payment.status = "SUCCEEDED"
-        payment.requires_review = False
-        payment.review_reason = None
-        payment.next_reconciliation_at = None
-        payment.retry_window_expires_at = None
-        order.status = "CONFIRMED"
-
-        db.commit()
-        db.refresh(payment)
-        return payment
-
     except Exception:
         db.rollback()
         logger.exception(
@@ -416,11 +443,10 @@ def reconcile_pending_payments(db: Session) -> int:
         if payment is None or payment.status != "PENDING":
             continue
 
-        provider_key = payment.provider_idempotency_key
         order_id = payment.order_id
 
         try:
-            result = get_test_payment_status(provider_key)
+            result = _query_provider_payment(payment)
             reconciled_count += 1
         except Exception:
             logger.exception(
@@ -460,139 +486,12 @@ def reconcile_pending_payments(db: Session) -> int:
             continue
 
         try:
-            # Match create_payment's lock order: order first, payment second.
-            order = _lock_order(db, order_id)
-            payment = db.scalar(
-                select(Payment)
-                .where(Payment.id == payment_id)
-                .with_for_update()
+            apply_payment_result(
+                db,
+                payment_id,
+                result,
+                reconciled=True,
             )
-
-            # Another request or worker may have resolved this payment.
-            if (
-                order is None
-                or payment is None
-                or payment.status != "PENDING"
-                or not payment.requires_review
-            ):
-                db.rollback()
-                continue
-
-            payment.last_reconciled_at = _now()
-
-            if result.provider_reference:
-                payment.provider_reference = result.provider_reference
-
-            # Uncertain outcomes must preserve the reservation.
-            if result.status in (
-                ProviderPaymentStatus.PROCESSING,
-                ProviderPaymentStatus.UNKNOWN,
-            ):
-                _mark_for_review(
-                    payment,
-                    result.message or f"Provider status: {result.status.value}",
-                )
-                db.commit()
-                continue
-
-            if result.status == ProviderPaymentStatus.FAILED:
-                payment.status = "FAILED"
-                payment.requires_review = False
-                payment.review_reason = None
-                payment.next_reconciliation_at = None
-
-                if payment.attempt_number < MAX_PAYMENT_ATTEMPTS:
-                    payment.retry_window_expires_at = _now() + RETRY_WINDOW
-                elif order.status == "PENDING_PAYMENT":
-                    _release_reserved_inventory(db, order.id)
-                    order.status = "CANCELLED"
-
-                db.commit()
-                continue
-
-            if result.status != ProviderPaymentStatus.SUCCEEDED:
-                _mark_for_review(payment, "Unrecognized provider status")
-                db.commit()
-                continue
-
-            # The provider says the payment succeeded. Do not silently
-            # confirm an order that has already been cancelled or changed.
-            if order.status != "PENDING_PAYMENT":
-                _mark_for_review(
-                    payment,
-                    "Provider reported success but order is no longer pending",
-                )
-                db.commit()
-                continue
-
-            items = db.scalars(
-                select(OrderItem)
-                .where(OrderItem.order_id == order.id)
-                .order_by(OrderItem.product_id)
-            ).all()
-
-            # Aggregate quantities in case an order has multiple rows for
-            # the same product.
-            quantities_by_product: dict[int, int] = {}
-            for item in items:
-                quantities_by_product[item.product_id] = (
-                    quantities_by_product.get(item.product_id, 0)
-                    + item.quantity
-                )
-
-            product_ids = sorted(quantities_by_product)
-
-            inventories = []
-            if product_ids:
-                inventories = db.scalars(
-                    select(Inventory)
-                    .where(Inventory.product_id.in_(product_ids))
-                    .order_by(Inventory.product_id)
-                    .with_for_update()
-                ).all()
-
-            inventory_by_product = {
-                inventory.product_id: inventory
-                for inventory in inventories
-            }
-
-            if len(inventory_by_product) != len(product_ids):
-                _mark_for_review(
-                    payment,
-                    "Inventory is missing after provider success",
-                )
-                db.commit()
-                continue
-
-            # Validate every reservation before changing any inventory.
-            inventory_is_valid = all(
-                inventory_by_product[product_id].quantity_reserved >= quantity
-                and inventory_by_product[product_id].quantity_on_hand >= quantity
-                for product_id, quantity in quantities_by_product.items()
-            )
-
-            if not inventory_is_valid:
-                _mark_for_review(
-                    payment,
-                    "Inventory reservation is inconsistent after provider success",
-                )
-                db.commit()
-                continue
-
-            for product_id, quantity in quantities_by_product.items():
-                inventory = inventory_by_product[product_id]
-                inventory.quantity_reserved -= quantity
-                inventory.quantity_on_hand -= quantity
-
-            payment.status = "SUCCEEDED"
-            payment.requires_review = False
-            payment.review_reason = None
-            payment.next_reconciliation_at = None
-            payment.retry_window_expires_at = None
-            order.status = "CONFIRMED"
-
-            db.commit()
-
         except Exception:
             db.rollback()
             logger.exception(

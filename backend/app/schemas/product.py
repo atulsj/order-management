@@ -29,3 +29,14 @@ class ProductResponse(BaseModel):
     description: str | None
     price: Decimal
     is_active: bool
+
+
+class CatalogProductResponse(ProductResponse):
+    quantity_available: int
+
+
+class ProductListResponse(BaseModel):
+    items: list[CatalogProductResponse]
+    total: int
+    limit: int
+    offset: int

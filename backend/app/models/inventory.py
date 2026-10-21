@@ -1,12 +1,10 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, func
-
-from app.models.product import Product 
-from sqlalchemy import CheckConstraint, ForeignKey, Integer, text
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, UniqueConstraint, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.base import Base
+from app.models.product import Product
 
 
 class Inventory(Base):
@@ -25,14 +23,26 @@ class Inventory(Base):
             "quantity_reserved <= quantity_on_hand",
             name="ck_inventory_reserved_not_above_on_hand",
         ),
+        UniqueConstraint(
+            "warehouse_id",
+            "product_id",
+            name="uq_inventory_warehouse_product",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
 
+    warehouse_id: Mapped[int] = mapped_column(
+        ForeignKey("warehouses.id", ondelete="RESTRICT"),
+        nullable=False,
+        server_default=text("1"),
+        index=True,
+    )
+
     product_id: Mapped[int] = mapped_column(
         ForeignKey("products.id", ondelete="RESTRICT"),
-        unique=True,
         nullable=False,
+        index=True,
     )
 
     quantity_on_hand: Mapped[int] = mapped_column(
@@ -55,3 +65,8 @@ class Inventory(Base):
     )
     
     product: Mapped["Product"] = relationship()
+    warehouse: Mapped["Warehouse"] = relationship(back_populates="inventories")
+    allocations: Mapped[list["InventoryAllocation"]] = relationship(
+        back_populates="inventory"
+    )
+    movements: Mapped[list["StockMovement"]] = relationship(back_populates="inventory")
